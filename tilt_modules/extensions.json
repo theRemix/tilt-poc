@@ -1,0 +1,14 @@
+{
+  "Extensions": [
+    {
+      "Name": "git_resource",
+      "ExtensionRegistry": "https://github.com/tilt-dev/tilt-extensions",
+      "TimeFetched": "2021-07-28T13:38:57.869077-07:00"
+    },
+    {
+      "Name": "namespace",
+      "ExtensionRegistry": "https://github.com/tilt-dev/tilt-extensions",
+      "TimeFetched": "2021-07-28T13:38:59.158545-07:00"
+    }
+  ]
+}

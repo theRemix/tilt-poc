@@ -1,0 +1,181 @@
+
+def _find_root_tiltfile_dir():
+    # Find top-level Tilt path
+    current = os.path.abspath('./')
+    while current != '/':
+        if os.path.exists(os.path.join(current, 'tilt_modules')):
+            return current
+
+        current = os.path.dirname(current)
+
+    fail('Could not find root Tiltfile')
+
+def _find_checkout_dir():
+    from_env = os.getenv('TILT_GIT_RESOURCE_CHECKOUT_DIR', '')
+    if from_env != '':
+        return from_env
+    return os.path.join(_find_root_tiltfile_dir(), '.git-sources')
+
+# this is the root directory into which remote git repositories will be cloned
+# use `os.putenv('TILT_GIT_RESOURCE_CHECKOUT_DIR', new_dir)` to change
+# if customizing this location, you will also need to add the new location to your .tiltignore file to prevent infinite loops processing the main tiltfile (See github [issue #3404](https://github.com/tilt-dev/tilt/issues/3404))
+git_resource_checkout_dir = _find_checkout_dir()
+
+def git_resource(resource_name, path_or_repo, dockerfile='Dockerfile', namespace='default', resource_deps=[], port_forwards=[], build_callback=None, deployment_callback=None):
+    is_http = path_or_repo[:4].lower() == 'http'
+    is_ssh = path_or_repo[:4].lower() == 'git@'
+    is_local = not is_http and not is_ssh
+
+    if is_local:
+        deploy_from_dir(resource_name, path_or_repo, dockerfile=dockerfile, namespace=namespace, resource_deps=resource_deps, port_forwards=port_forwards, build_callback=build_callback, deployment_callback=deployment_callback)
+    else:
+        deploy_from_repository(resource_name, path_or_repo, dockerfile=dockerfile, namespace=namespace, resource_deps=resource_deps, port_forwards=port_forwards, build_callback=build_callback, deployment_callback=deployment_callback)
+
+
+def git_checkout(repository_url, checkout_dir=None, unsafe_mode=False):
+    if checkout_dir == '' or checkout_dir == None:
+        checkout_dir = _get_default_checkout_target(repository_url)
+
+    repository_url, _, tree = _parse_repository_url(repository_url)  # split the branch name away from the repo url
+
+    if config.tilt_subcommand == "up" or config.tilt_subcommand == "ci":
+        is_branch = tree.startswith('#')
+        is_revision = tree.startswith('@')
+        is_tag = tree.startswith('#tags/')
+        tree = tree[1:]
+
+        if is_tag:
+            tree = tree[5:]
+
+        if tree.startswith('origin/'):
+            tree = tree[7:]
+
+        if not os.path.exists(checkout_dir):  # needs clone
+            if is_branch or is_tag:
+                branch_flag = ''
+                if tree:
+                    branch_flag = '--branch %s' % tree
+
+                local('git clone {repository_url} --recurse-submodules --shallow-submodules --depth 1 {branch_flag} {checkout_dir}'.
+                      format(repository_url=repository_url, branch_flag=branch_flag, checkout_dir=checkout_dir), quiet=True)
+            else:
+                checkout_cmd = ''
+                if tree:
+                    checkout_cmd = ' && git checkout %s' % tree
+
+                local('git clone {repository_url} --recurse-submodules --shallow-submodules {checkout_dir} && cd {checkout_dir} {checkout_cmd}'.
+                      format(repository_url=repository_url, checkout_dir=checkout_dir, checkout_cmd=checkout_cmd), quiet=True)
+        else:  # dir already exists
+            if os.path.exists('%s/.git' % checkout_dir):  # this is a git repo
+                has_local_changes = True  # default to True for safety
+                if not unsafe_mode:
+                    has_local_changes = int(str(local('cd %s && git status -sbuno | wc -l' % checkout_dir, quiet=True)).strip()) > 1  # result greater than 1 indicates local modifications are present
+
+                if unsafe_mode or not has_local_changes:
+                    checkout_cmd = ''
+                    if tree:
+                        checkout_branch = tree
+                        if not is_tag and not is_revision:
+                            checkout_branch = 'origin/%s' % tree
+
+                        checkout_cmd = '&& git checkout -f %s' % checkout_branch
+
+                    local('cd {checkout_dir} && git fetch -a origin {checkout_cmd} && git submodule update --init'.
+                          format(checkout_dir=checkout_dir, checkout_cmd=checkout_cmd), quiet=True)
+                else:
+                    fail('git_checkout() failed: local modifications present and safe_mode is enabled')
+
+            else:  # this isn't a git repo
+                fail('git_checkout() failed: existing checkout_dir is not a git repository')
+
+    return checkout_dir
+
+
+def deploy_from_dir(resource_name, directory, dockerfile='Dockerfile', namespace='default', resource_deps=[], port_forwards=[], build_callback=None, deployment_callback=None):
+    if deployment_callback == None:
+        deployment_callback = lambda resource_name, image_name, namespace: _default_deployment_callback(resource_name, image_name, namespace)
+
+    if build_callback == None:
+        build_callback = lambda resource_name, directory, dockerfile: _default_build_callback(resource_name, directory, dockerfile=dockerfile)
+
+    image_name = build_callback(resource_name, directory, dockerfile=dockerfile)
+    yaml = deployment_callback(resource_name, image_name, namespace)
+
+    k8s_yaml(yaml)
+    k8s_resource(resource_name, resource_deps=resource_deps, port_forwards=port_forwards)
+
+
+def deploy_from_repository(name, repository_url, dockerfile='Dockerfile', namespace='default', resource_deps=[], port_forwards=[], build_callback=None, deployment_callback=None):
+    checkout_path = git_checkout(repository_url)
+    deploy_from_dir(name, checkout_path, dockerfile=dockerfile, namespace=namespace, resource_deps=resource_deps, port_forwards=port_forwards, build_callback=build_callback, deployment_callback=deployment_callback)
+
+
+def _parse_repository_url(url):
+    is_ssh = url.startswith('git@')
+    if is_ssh:
+        url = url[4:]
+
+    splitter = None
+    if '#' in url:
+        splitter = '#'
+    elif '@' in url:
+        splitter = '@'
+
+    if splitter == None:
+        tree = ''
+    else:
+        parts = url.split(splitter)
+        tree = splitter + parts[-1]  # last item
+
+        # Make sure we didn't peel of a scheme://user@host/ url
+        if splitter == '@' and '/' in tree:
+            tree = ''
+        else:
+            url = splitter.join(parts[:-1])  # everything else
+
+    if is_ssh:
+        url = 'git@' + url
+
+    repository_name = str(local('basename %s .git' % url, quiet=True)).strip()
+
+    return url, repository_name, tree
+
+
+def _get_default_checkout_target(repository_url):
+    url, repository_name, branch = _parse_repository_url(repository_url)
+    checkout_dir = '%s/%s' % (git_resource_checkout_dir, repository_name)
+
+    return checkout_dir
+
+
+def _default_build_callback(resource_name, context, dockerfile='Dockerfile'):  # returns resultant image name
+    image_name = resource_name + '-image'
+    docker_build(image_name, context, dockerfile='%s/%s' % (context, dockerfile), ssh='default')
+
+    return image_name
+
+
+def _default_deployment_callback(resource_name, image_name, namespace='default'):  # returns deployment definition yaml
+    """Returns YAML for a generic deployment
+    Args:    image_name: The name of the image to deploy. Currently not validated.
+    """
+    return blob("""apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    app: %s
+spec:
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      containers:
+      - name: %s
+        image: %s
+""" % (resource_name, namespace, resource_name, resource_name, resource_name, resource_name, image_name))
